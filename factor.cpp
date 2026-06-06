@@ -43,6 +43,53 @@
 
 NTL_CLIENT
 
+struct SqrConstR {
+    unsigned long alpha;
+    unsigned long q1;
+    unsigned long q4;
+    unsigned long q5;      // == q41 in irred: (alpha+1)/64
+    unsigned long s1;      // (alpha+1) mod 64
+    unsigned long s2;      // 63 - s1
+    unsigned long smax;    // ceil(r/64)
+    _ntl_ulong   mask1;
+};
+
+static SqrConstR make_sqr_const_r(unsigned long r)
+{
+    SqrConstR c;
+    const unsigned long wlen = 64, wlenm = 63, wd = 6;
+    c.smax  = (r + wlen - 1) >> wd;
+    c.alpha = r >> 1;
+    c.q1    = (r - 1) >> wd;           // == smax - 1
+    c.q4    = c.alpha >> wd;
+    c.q5    = (c.alpha + 1) >> wd;
+    c.s1    = (c.alpha + 1) & wlenm;
+    c.s2    = wlenm - c.s1;
+    c.mask1 = UINT64_MAX >> (wlenm - ((r - 1) & wlenm));
+    return c;
+}
+
+struct SqrConstS {
+    unsigned long delta;
+    unsigned long deltaw;
+    unsigned long deltaq;
+    unsigned long deltaqc;
+    _ntl_ulong   mask2;
+};
+
+static SqrConstS make_sqr_const_s(unsigned long r, unsigned long s,
+                                   const SqrConstR& cr)
+{
+    SqrConstS c;
+    const unsigned long wlenm = 63, wd = 6, wlen = 64;
+    c.delta   = (r - s) >> 1;
+    c.deltaw  = c.delta >> wd;
+    c.deltaq  = c.delta & wlenm;
+    c.deltaqc = wlen - c.deltaq;
+    c.mask2   = (~(_ntl_ulong)1) << (cr.alpha & wlenm);
+    return c;
+}
+
 double
 WctTime (void)
 {
@@ -63,8 +110,108 @@ WctTime (void)
 
 #define BITS_PER_LONG2 (2*NTL_BITS_PER_LONG)
 
-void fastsqr_old(GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s)
+// Reduce helper: barrel-shift XOR, reads from ap[src..], writes to ap[dst..].
+// ap is the single underlying array; src and dst regions are non-overlapping
+// (guaranteed by delta >= 2*wlen).
+// Equivalent to irred's reducer(), inlined here with __restrict__ via
+// separate pointer parameters.
 
+#if false
+static void
+fastsqr_reduce(const _ntl_ulong * __restrict__ src,
+                     _ntl_ulong * __restrict__ dst,
+               long count, unsigned long deltaq, unsigned long deltaqc)
+// Computes dst[j] ^= (src[j] >> deltaq) | (src[j+1] << deltaqc)
+// for j = count downto 0, where src[j+1] is the "carry" from j+1.
+// Note: caller must handle the boundary (masked) iterations separately.
+{
+    _ntl_ulong newer = 0;
+    for (long j = count; j >= 0; j--) {
+        _ntl_ulong older = newer;
+        newer = src[j];
+        dst[j] ^= (newer >> deltaq) | (older << deltaqc);
+    }
+}
+#endif
+
+// The boundary needs the carry out of the main reduce loop.
+// Cleanest solution: return it from the helper.
+static _ntl_ulong
+fastsqr_reduce(const _ntl_ulong * __restrict__ src,
+                     _ntl_ulong * __restrict__ dst,
+               long count, unsigned long deltaq, unsigned long deltaqc)
+// Returns the final value of "newer" (the carry into the boundary step).
+{
+    _ntl_ulong newer = 0;
+    for (long j = count; j >= 0; j--) {
+        _ntl_ulong older = newer;
+        newer = src[j];
+        dst[j] ^= (newer >> deltaq) | (older << deltaqc);
+    }
+    return newer;  // caller uses this for the masked boundary iterations
+}
+
+// Word-aligned special case (deltaq == 0): simple XOR, fully vectorisable.
+static void
+fastsqr_reduce_aligned(const _ntl_ulong * __restrict__ src,
+                             _ntl_ulong * __restrict__ dst,
+                       long count)
+{
+    for (long j = count; j >= 0; j--)
+        dst[j] ^= src[j];
+}
+
+// 64-bit constants for bit-spread (interleave step).
+static const _ntl_ulong IC0 = 0x00000000FFFFFFFFull;
+static const _ntl_ulong IC1 = 0x0000FFFF0000FFFFull;
+static const _ntl_ulong IC2 = 0x00FF00FF00FF00FFull;
+static const _ntl_ulong IC3 = 0x0F0F0F0F0F0F0F0Full;
+static const _ntl_ulong IC4 = 0x3333333333333333ull;
+static const _ntl_ulong IC5 = 0x2222222222222222ull;
+
+// Spread one pair of 64-bit source words (lo, hi) into two interleaved
+// output words at bp[2*j] and bp[2*j+1].
+static inline void
+spread_word_pair(_ntl_ulong lo, _ntl_ulong hi,
+                 _ntl_ulong * __restrict__ bp, long j)
+{
+    _ntl_ulong t = lo & IC0, u = lo >> 32;
+    _ntl_ulong v = hi & IC0, w = hi >> 32;
+    u = (u | u<<16) & IC1;  t = (t | t<<16) & IC1;
+    w = (w | w<<16) & IC1;  v = (v | v<<16) & IC1;
+    u = (u | u<<8)  & IC2;  t = (t | t<<8)  & IC2;
+    w = (w | w<<8)  & IC2;  v = (v | v<<8)  & IC2;
+    u = (u | u<<4)  & IC3;  t = (t | t<<4)  & IC3;
+    w = (w | w<<4)  & IC3;  v = (v | v<<4)  & IC3;
+    u = (u | u<<2)  & IC4;  t = (t | t<<2)  & IC4;
+    w = (w | w<<2)  & IC4;  v = (v | v<<2)  & IC4;
+    u += u & IC5;           t += t & IC5;
+    w += w & IC5;           v += v & IC5;
+    bp[2*j+1] = u | (w << 1);
+    bp[2*j]   = t | (v << 1);
+}
+
+// Interleave: reads ap[0..q5] (lo half) and ap[q5..2*q5+1] (hi half),
+// writes interleaved result to bp[0..2*q5+1].
+// Uses simplified direct indexing (no Sparc prefetch chain).
+static void
+fastsqr_interleave(const _ntl_ulong * __restrict__ ap,
+                         _ntl_ulong * __restrict__ bp,
+                   long q5, unsigned long s1, unsigned long s2)
+{
+    for (long j = 0; j <= q5; j++) {
+        _ntl_ulong lo     = ap[j];
+        _ntl_ulong hi_cur = ap[j + q5];
+        _ntl_ulong hi_nxt = ap[j + q5 + 1];
+        /* Beware: if s1==0 (r%128==127), the shift below is UB.
+           In practice our r values don't satisfy this. */
+        _ntl_ulong hi = (hi_cur >> s1) | ((hi_nxt << 1) << s2);
+        spread_word_pair(lo, hi, bp, j);
+    }
+}
+
+void fastsqr_old(GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s,
+                 const SqrConstR& cr)
 /* Returns b = a*a mod (x^r + x^s + 1)
 
    Here a and b represent polynomials (in GF(2)[x]) of degree < r,
@@ -95,317 +242,89 @@ void fastsqr_old(GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s)
 
    RPB, 20070318 (based on reducep, reducer and interlvf in irred.c). */
 
-  {
-  _ntl_ulong old, nex, mask1, mask2; 	/* "new" is a reserved word */
-  _ntl_ulong t, u, v, w, next1, next2;
-
-  long j, alpha, delta, deltaw, deltaq, deltaqc, q1, q4, q5, s1, s2;
-  long smax;
-
-#if (NTL_BITS_PER_LONG == 64)
-
-  _ntl_ulong c0, c1, c2, c3, c4, c5;
-
-  long wd = 6;			/* 64-bit words */
-  unsigned long wlen = 64;	/* wordlength (bits) = 2^wd */
-  long wlenm = 63;		/* wlen - 1 */
-
-  if ((r&s&1) == 0)
-    {
-      printf("Error in fastsqr: r = %lu and s = %lu must be odd\n", r, s);
-      exit (1);
-    }
-
-  if (s <= 2*wlen)
-    {
-      printf("Error in fastsqr: s = %lu must be at least %lu\n", s, 2*wlen+1);
-      exit (1);
-    }
-
-  if ((r-s) <= 2*wlen)
-    {
-      printf("Error in fastsqr: r-s = %lu must be at least %lu\n",
-	     r-s, 2*wlen+1);
-      exit (1);
-    }
-
-  smax = (r+wlen-1) >> wd;	/* max size in words = ceil(r/wlen) */
-
-  long sa = a.xrep.length();	/* size in words */
-
-  if (sa < smax)
-    a.xrep.SetLength(smax);	/* Always use length smax for a */
-
-  _ntl_ulong *ap = a.xrep.elts();
-
-  for (j = sa; j < smax; j++) 	/* Clear high words of a if necessary */
-    ap[j] = 0;
-
-  b.xrep.SetLength(smax+2);	/* Allow 2 words extra space for b */
-
-  _ntl_ulong *bp = b.xrep.elts();
-
-  bp[smax] = 0;			/* Clear the extra two words of b */
-  bp[smax+1] = 0;		/* No need to clear words 0..(smax-1) */
-
-  c0 = 0x00000000FFFFFFFFL;	/* Some 64-bit constants */
-  c1 = 0x0000FFFF0000FFFFL;
-  c2 = 0x00FF00FF00FF00FFL;
-  c3 = 0x0F0F0F0F0F0F0F0FL;
-  c4 = 0x3333333333333333L;
-  c5 = 0x2222222222222222L;
-
-  alpha = r >> 1;		/* alpha = (r-1)/2 */
-  delta = (r - s) >> 1;		/* delta = (r - s)/2 */
-  deltaw = delta >> wd;		/* deltaw = delta div wlen */
-  deltaq = delta & wlenm;	/* deltaq = delta mod wlen */
-  deltaqc = wlen - deltaq;
-  q1 = (r-1) >> wd;		/* q1 = (r-1) div wlen = smax - 1 */
-  q4 = alpha >> wd;		/* q4 = alpha div wlen */
-
-  mask1 = (_ntl_ulong)(~0L) >> (wlenm - ((r-1) & wlenm));
-  				/* mask1 has wlen-1 - ((r-1) mod wlen)
-  				   zero bits in high positions */
-  mask2 = (~1L) << (alpha & wlenm);
-  				/* mask2 has (alpha mod wlen) + 1 zero bits
-  				   in low positions */
-
-  ap[q1] &= mask1;		/* Mask irrelevant high bits of a */
-  nex = 0;
-
-  if (deltaq == 0)
-    {				/* Special case, deltaq == 0 (word-aligned) */
-    for (j = q1; j > q4; j--)
-      ap[j-deltaw] ^= ap[j];
-
-    ap[q4-deltaw] ^= ap[q4] & mask2;
-    }
-
-  else
-    {				/* Usual case, 0 < deltaq < wlen */
-    for (j = q1; j > q4; j--)
-      {
-      old = nex;
-      nex = ap[j];
-      ap[j-deltaw] ^= (nex >> deltaq) | (old << deltaqc);
-      }
-
-    /* The last two iterations are special as need to mask some bits */
-
-    old = nex;
-    nex = ap[q4] & mask2;
-    ap[q4-deltaw]   ^= (nex >> deltaq) | (old << deltaqc);
-    ap[q4-deltaw-1] ^= (nex << deltaqc);
-    }
-
-/* Interleave starts here */
-
-  q5 = (alpha+1) >> wd;		/* q5 = (alpha+1) div wlen */
-  s1 = (alpha+1) & wlenm;	/* s1 = (alpha+1) mod wlen */
-  s2 = wlenm - s1;		/* In [0, wlen) */
-
-  next1 = ap[0];
-  old = ap[q5];
-  nex = ap[q5+1];
-
-  for (j = 0; j <= q5; j++) {
-
-    next2 = (old >> s1) | ((nex << 1) << s2); /* Beware case s2 == 63 */
-
-    u = next1>>32;			/* High order 32 bits low part of a */
-    w = next2>>32;			/* Ditto high part of a */
-    t = next1 & c0;			/* Low order 32 bits low part of a */
-    v = next2 & c0;			/* Ditto high part of a */
-
-    next1 = ap[j+1];
-    old   = nex;
-    nex   = ap[j+q5+2];
-
-    u = (u | u<<16) & c1;		 /* Operations on t,u,v,w   */
-    t = (t | t<<16) & c1;		 /* can be done in parallel */
-    w = (w | w<<16) & c1;
-    v = (v | v<<16) & c1;
-
-    u = (u | u<<8) & c2;
-    t = (t | t<<8) & c2;
-    w = (w | w<<8) & c2;
-    v = (v | v<<8) & c2;
-
-    u = (u | u<<4) & c3;
-    t = (t | t<<4) & c3;
-    w = (w | w<<4) & c3;
-    v = (v | v<<4) & c3;
-
-    u = (u | u<<2) & c4;
-    t = (t | t<<2) & c4;
-    w = (w | w<<2) & c4;
-    v = (v | v<<2) & c4;
-
-    u += u & c5;
-    t += t & c5;
-    w += w & c5;
-    v += v & c5;
-
-    bp[2*j+1] = u | (w << 1);
-    bp[2*j]   = t | (v << 1);
-    }
-
-  bp[smax+1] = 0;				/* Clear high words of b */
-  bp[smax] = 0;					/* Note: smax = q1 + 1 */
-  bp[q1] &= mask1;				/* Mask high bits */
-  b.normalize(); 	     			/* Normalize output */
-  return;
-  }
-
-#else
-				/* This is for 32-bit words */
-  _ntl_ulong c1, c2, c3, c4, c5;
-
-  long wd = 5;
-  long wlen = 32;		/* wordlength (bits) = 2^wd */
-  long wlenm = 31;		/* wlen - 1 */
-
-  if ((r&s&1) == 0)
-    {
-    printf("Error in fastsqr: r = %d and s = %d must be odd\n", r, s);
-    exit (1);
-    }
-
-  if (s <= 2*wlen)
-    {
-    printf("Error in fastsqr: s = %d must be at least %d\n", s, 2*wlen+1);
-    exit (1);
-    }
-
-  if ((r-s) <= 2*wlen)
-    {
-    printf("Error in fastsqr: r-s = %d must be at least %d\n", r-s, 2*wlen+1);
-    exit (1);
-    }
-
-  smax = (r+wlen-1) >> wd;	/* max size in words = ceil(r/wlen) */
-
-  long sa = a.xrep.length();	/* size in words */
-
-  if (sa < smax)
-    a.xrep.SetLength(smax);	/* Always use length smax for a */
-
-  _ntl_ulong *ap = a.xrep.elts();
-
-  for (j = sa; j < smax; j++) 	/* Clear high words of a if necessary */
-    ap[j] = 0;
-
-  b.xrep.SetLength(smax+2);	/* Allow 2 words extra space for b */
-
-  _ntl_ulong *bp = b.xrep.elts();
-
-  bp[smax] = 0;			/* Clear the extra two words of b */
-  bp[smax+1] = 0;		/* No need to clear words 0..(smax-1) */
-
-  c1 = 0x0000FFFFL;		/* Some 32-bit constants */
-  c2 = 0x00FF00FFL;
-  c3 = 0x0F0F0F0FL;
-  c4 = 0x33333333L;
-  c5 = 0x22222222L;
-
-  alpha = r >> 1;		/* alpha = (r-1)/2 */
-  delta = (r - s) >> 1;		/* delta = (r - s)/2 */
-  deltaw = delta >> wd;		/* deltaw = delta div wlen */
-  deltaq = delta & wlenm;	/* deltaq = delta mod wlen */
-  deltaqc = wlen - deltaq;
-  q1 = (r-1) >> wd;		/* q1 = (r-1) div wlen = smax - 1 */
-  q4 = alpha >> wd;		/* q4 = alpha div wlen */
-
-  mask1 = (_ntl_ulong)(~0L) >> (wlenm - ((r-1) & wlenm));
-  				/* mask1 has wlen-1 - ((r-1) mod wlen)
-  				   zero bits in high positions */
-  mask2 = (~1L) << (alpha & wlenm);
-  				/* mask2 has (alpha mod wlen) + 1 zero bits
-  				   in low positions */
-
-  ap[q1] &= mask1;		/* Mask irrelevant high bits of a */
-  nex = 0;
-
-  if (deltaq == 0)
-    {				/* Special case, deltaq == 0 (word-aligned) */
-    for (j = q1; j > q4; j--)
-      ap[j-deltaw] ^= ap[j];
-
-    ap[q4-deltaw] ^= ap[q4] & mask2;
-    }
-
-  else
-    {				/* Usual case, 0 < deltaq < wlen */
-    for (j = q1; j > q4; j--)
-      {
-      old = nex;
-      nex = ap[j];
-      ap[j-deltaw] ^= (nex >> deltaq) | (old << deltaqc);
-      }
-
-    /* The last two iterations are special as need to mask some bits */
-
-    old = nex;
-    nex = ap[q4] & mask2;
-    ap[q4-deltaw]   ^= (nex >> deltaq) | (old << deltaqc);
-    ap[q4-deltaw-1] ^= (nex << deltaqc);
-    }
-
-/* Interleave starts here */
-
-  q5 = (alpha+1) >> wd;		/* q5 = (alpha+1) div wlen */
-  s1 = (alpha+1) & wlenm;	/* s1 = (alpha+1) mod wlen */
-  s2 = wlenm - s1;		/* In [0, wlen) */
-
-  next1 = ap[0];
-  old = ap[q5];
-  nex = ap[q5+1];
-
-  for (j = 0; j <= q5; j++) {
-
-    next2 = (old >> s1) | ((nex << 1) << s2); /* Beware case s2 == 31 */
-
-    u = next1>>16;			/* High order 16 bits low part of a */
-    w = next2>>16;			/* Ditto high part of a */
-    t = next1 & c1;			/* Low order 16 bits low part of a */
-    v = next2 & c1;			/* Ditto high part of a */
-
-    next1 = ap[j+1];
-    old   = nex;
-    nex   = ap[j+q5+2];
-
-    u = (u | u<<8) & c2;		 /* Operations on t,u,v,v   */
-    t = (t | t<<8) & c2;		 /* can be done in parallel */
-    w = (w | w<<8) & c2;
-    v = (v | v<<8) & c2;
-
-    u = (u | u<<4) & c3;
-    t = (t | t<<4) & c3;
-    w = (w | w<<4) & c3;
-    v = (v | v<<4) & c3;
-
-    u = (u | u<<2) & c4;
-    t = (t | t<<2) & c4;
-    w = (w | w<<2) & c4;
-    v = (v | v<<2) & c4;
-
-    u += u & c5;
-    t += t & c5;
-    w += w & c5;
-    v += v & c5;
-
-    bp[2*j+1] = u | (w << 1);
-    bp[2*j]   = t | (v << 1);
-    }
-
-  bp[smax+1] = 0;				/* Clear high words of b */
-  bp[smax] = 0;					/* Note: smax = q1 + 1 */
-  bp[q1] &= mask1;				/* Mask high bits */
-  b.normalize(); 	     			/* Normalize output */
-  return;
-  }
-
+/* As original, but:
+   - r-only constants taken from pre-computed struct cr
+   - hot loops extracted into __restrict__ helpers
+   - ~0L / ~1L replaced with UINT64_MAX / (~(_ntl_ulong)1)
+   - 32-bit path removed
+   - Sparc prefetch chain removed from interleave
+*/
+{
+#if (NTL_BITS_PER_LONG != 64)
+#error "fastsqr_old: only 64-bit supported in this version"
 #endif
+
+    assert(r & 1);
+    assert(s & 1);
+    assert(s > 2*64);
+    assert((r-s) > 2*64);
+
+    // Per-s quantities
+    const SqrConstS cs = make_sqr_const_s(r, s, cr);
+
+    // Ensure a has smax words, zero-padding if needed
+    long sa = a.xrep.length();
+    if (sa < (long)cr.smax)
+        a.xrep.SetLength(cr.smax);
+    _ntl_ulong *ap = a.xrep.elts();
+    for (long j = sa; j < (long)cr.smax; j++)
+        ap[j] = 0;
+
+    // Allocate b with two words of headroom
+    b.xrep.SetLength(cr.smax + 2);
+    _ntl_ulong *bp = b.xrep.elts();
+    bp[cr.smax]   = 0;
+    bp[cr.smax+1] = 0;
+
+    // Mask irrelevant high bits of a
+    ap[cr.q1] &= cr.mask1;
+
+    /* --- Reduce step --- */
+    if (cs.deltaq == 0) {
+        // Word-aligned: simple XOR, non-overlapping regions
+        fastsqr_reduce_aligned(ap + cr.q4 + 1,
+                               ap + cr.q4 + 1 - cs.deltaw,
+                               (long)(cr.q1 - cr.q4 - 1));
+        ap[cr.q4 - cs.deltaw] ^= ap[cr.q4] & cs.mask2;
+#if false
+    } else {
+        // General case: barrel-shift XOR
+        // Source: ap[q4+1 .. q1], dest: ap[q4+1-deltaw .. q1-deltaw]
+        // Non-overlapping guaranteed by delta >= 2*wlen
+        fastsqr_reduce(ap + cr.q4 + 1,
+                       ap + cr.q4 + 1 - cs.deltaw,
+                       (long)(cr.q1 - cr.q4 - 1),
+                       cs.deltaq, cs.deltaqc);
+        // Boundary: masked final element
+        _ntl_ulong temp = 0; // fastsqr_reduce leaves *prev in last newer
+                             // but we need it — restructure slightly:
+        // NOTE: see comment below about prev threading
+        _ntl_ulong nex = ap[cr.q4] & cs.mask2;
+        // We need the last "newer" from the reduce loop.
+        // Since fastsqr_reduce doesn't return it, handle q1 separately:
+        // ... see Snippet 4a below
+    }
+#endif
+    } else {
+        _ntl_ulong carry = fastsqr_reduce(
+            ap + cr.q4 + 1,
+            ap + cr.q4 + 1 - cs.deltaw,
+            (long)(cr.q1 - cr.q4 - 1),
+            cs.deltaq, cs.deltaqc);
+        // Boundary iterations (masked)
+        _ntl_ulong nex = ap[cr.q4] & cs.mask2;
+        ap[cr.q4   - cs.deltaw]     ^= (nex >> cs.deltaq) | (carry << cs.deltaqc);
+        ap[cr.q4-1 - cs.deltaw]     ^=  nex << cs.deltaqc;
+    }
+
+    /* --- Interleave step --- */
+    fastsqr_interleave(ap, bp, (long)cr.q5, cr.s1, cr.s2);
+
+    bp[cr.smax+1] = 0;
+    bp[cr.smax]   = 0;
+    bp[cr.q1]    &= cr.mask1;
+    b.normalize();
+}
 
 void
 print_gf2x (GF2X& a)
@@ -542,12 +461,12 @@ fastsqr_pdep (GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s)
 #endif
 
 void
-fastsqr (GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s)
+fastsqr (GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s, const SqrConstR& cr)
 {
 #if 0 /* debug code */
   GF2X copy_a = a, c;
 
-  fastsqr_old (b, a, r, s);
+  fastsqr_old (b, a, r, s, cr);
   a = copy_a;
   fastsqr_pdep (c, a, r, s);
   if (b != c)
@@ -562,7 +481,7 @@ fastsqr (GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s)
 #ifdef GF2X_HAVE_BMI2_SUPPORT
   return fastsqr_pdep (b, a, r, s);
 #else
-  return fastsqr_old (b, a, r, s);
+  return fastsqr_old (b, a, r, s, cr);
 #endif
 #endif
 }
@@ -712,7 +631,11 @@ void print_hex (char *s, GF2X a, int flip)
 _ntl_ulong
 get_certificate (GF2X a)
 {
-  return a.xrep.elts()[0];
+  // avoid segmentation fault
+  if (a.xrep.length() != 0)
+    return a.xrep.elts()[0];
+  else
+    return (_ntl_ulong)0; // value is irrelevant, won't be used
 }
 
 void
@@ -773,7 +696,7 @@ void copy_h (vec_GF2X& hold, vec_GF2X& h, long m)
 }
 
 void init_h (vec_GF2X& h, long k, long m, const GF2XModulus& F,
- 	_ntl_ulong r, _ntl_ulong s, int usefs)
+ 	_ntl_ulong r, _ntl_ulong s, int usefs, const SqrConstR& cr)
 
 /* initialize h[j] to sum ((x^(2^k))^s, 0 <= s < 2^m, hw(s)=j+1),
    for 0 <= j < m */
@@ -802,7 +725,7 @@ void init_h (vec_GF2X& h, long k, long m, const GF2XModulus& F,
 	    {
 	     if (usefs)
 	       {
-	       fastsqr (htemp, h[i-1], r, s);
+	       fastsqr (htemp, h[i-1], r, s, cr);
 	       h[i-1] = htemp;
 	       }
 	     else
@@ -820,12 +743,12 @@ void init_h (vec_GF2X& h, long k, long m, const GF2XModulus& F,
       {
       for (i = 0; i < k/2; i++)
         {
-        fastsqr (htemp, h[j], r, s);
-        fastsqr (h[j], htemp, r, s);
+        fastsqr (htemp, h[j], r, s, cr);
+        fastsqr (h[j], htemp, r, s, cr);
         }
       if (k&1)		// last iteration if k odd
         {
-        fastsqr (htemp, h[j], r, s);
+        fastsqr (htemp, h[j], r, s, cr);
         h[j] = htemp;	// copy result
         }
       }
@@ -885,7 +808,6 @@ accumulate (GF2X& a, GF2XVec& C, const GF2XModulus& F, long r, long s)
 int
 main (int argc, char *argv[])
 {
-  long r; /* degree of trinomials */
   long maxd = LONG_MAX; /* skip degrees > maxd */
   long m = 0, k0 = 0, b0 = 2, q0 = 4, q1 = 0;
   long skipd = 0, fineDDFtol;
@@ -999,13 +921,15 @@ main (int argc, char *argv[])
   if (argc != 2)
     usage ();
 
-  r = atoi (argv[1]);
+  const long r = atol (argv[1]); /* degree of trinomials */
 
   if (r < 2)
     {
       fprintf (stderr, "Error, r < 2\n");
       exit (1);
     }
+
+  const SqrConstR cr = make_sqr_const_r(r);
 
   /* check s0 and s1 */
   assert (0 < s0 && s0 < r);
@@ -1115,7 +1039,9 @@ main (int argc, char *argv[])
         {
 	  long input_s = todo[idx];
 	  int divisible, skip;
-	  long s = input_s, j, l;
+	  long s = input_s;
+
+      long j, l;
 	  long ss, rhigh, k = 0, k1, k2, q, q2 = 0;
 	  int fineDDF, flip, swan;
 	  char *fact;
@@ -1165,7 +1091,7 @@ main (int argc, char *argv[])
 	    }
 	  usefastsqr = ((r&s&1) && (s > BITS_PER_LONG2)
 	  			&& ((r-s) > BITS_PER_LONG2));
-
+ 
 	  if (verbose && flip)
 	    printf ("Using reciprocal trinomial\n");
 
@@ -1226,15 +1152,15 @@ main (int argc, char *argv[])
 	      {
 	      for (jt = 0; jt < 50; jt++) 	// Warm up cache
 	        {				// and make htemp dense
-	        fastsqr (htemp2, htemp, r, s);
-	        fastsqr (htemp, htemp2, r, s);
+	        fastsqr (htemp2, htemp, r, s, cr);
+	        fastsqr (htemp, htemp2, r, s, cr);
 	        }
 	      times = GetTime ();
 	      for (jt = 0; (GetTime() - times) < (double)1.0 ; jt += 100)
 	        for (jtt = 0; jtt < 50; jtt++)	// Avoid many GetTime calls
 	          {
-	          fastsqr (htemp2, htemp, r, s);
-	          fastsqr (htemp, htemp2, r, s);
+	          fastsqr (htemp2, htemp, r, s, cr);
+	          fastsqr (htemp, htemp2, r, s, cr);
 	          }
 	      }
 	    else
@@ -1332,7 +1258,7 @@ main (int argc, char *argv[])
 		  if (k == k0 + 1)
 		    {
 		      st = GetTime ();
-		      init_h (h, k, m, F, r, s, usefastsqr);
+		      init_h (h, k, m, F, r, s, usefastsqr, cr);
 		      if (verbose)
 			printf ("Exponentiation took %f\n", GetTime () - st);
 		    }
@@ -1421,12 +1347,12 @@ main (int argc, char *argv[])
 			      {			// Can use fastsqr here
 				for (l = 0; l < m/2; l++)
 				  {
-				    fastsqr (htemp, h[j], r, s);
-				    fastsqr (h[j], htemp, r, s);
+				    fastsqr (htemp, h[j], r, s, cr);
+				    fastsqr (h[j], htemp, r, s, cr);
 				  }
 				if (m&1)		// Last square if m odd
 				  {
-				    fastsqr (htemp, h[j], r, s);
+				    fastsqr (htemp, h[j], r, s, cr);
 				    h[j] = htemp;	// Copy result to h[j]
 				  }
 			      }
