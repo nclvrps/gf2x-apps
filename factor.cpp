@@ -256,8 +256,8 @@ void fastsqr_old(GF2X& b, GF2X& a, _ntl_ulong r, _ntl_ulong s,
 
     assert(r & 1);
     assert(s & 1);
-    assert(s > 2*64);
-    assert((r-s) > 2*64);
+    assert(s > 10*64);
+    assert((r-s) > 10*64);
 
     // Per-s quantities
     const SqrConstS cs = make_sqr_const_s(r, s, cr);
@@ -1024,6 +1024,7 @@ main (int argc, char *argv[])
 	if (ret != 1)
 	  break;
 	assert (0 < s && s < r);
+
 	todo[ntodo++] = s;
 	assert (ntodo <= r);
       }
